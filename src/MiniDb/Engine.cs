@@ -13,19 +13,21 @@ public class Database : IDisposable
 {
     internal Dictionary<string,Table> Tables = new(StringComparer.OrdinalIgnoreCase);
     Dictionary<string,Table>? backup;
-    public Database(string? path = null) { }
+    readonly string? path;
+    public Database(string? path = null) { this.path=path; if(path!=null && File.Exists(path)) Tables=DatabaseImage.Load(File.ReadAllBytes(path)); }
+    void Persist() { if(path==null) return; var image=DatabaseImage.Save(Tables); File.WriteAllBytes(path+".tmp",image); File.Move(path+".tmp",path,true); }
     public QueryResult Execute(string sql) => Execute(new Parser(sql).Parse());
     public QueryResult Execute(Statement statement)
     {
         if (statement is Transaction tx)
         {
             if (tx.Command == "BEGIN") { if (backup != null) throw new SqlException("Транзакция уже начата"); backup = Snapshot(); }
-            else { if (backup == null) throw new SqlException("Нет активной транзакции"); if (tx.Command == "ROLLBACK") Tables = backup; backup = null; }
+            else { if (backup == null) throw new SqlException("Нет активной транзакции"); if (tx.Command == "ROLLBACK") Tables = backup; else Persist(); backup = null; }
             return new([],[],tx.Command);
         }
         if (statement is Select select) return SelectRows(select);
         var before = Snapshot();
-        try { int changed = Mutate(statement); return new([],[],$"OK: {changed}"); }
+        try { int changed = Mutate(statement); _ = DatabaseImage.Save(Tables); if(backup==null) Persist(); return new([],[],$"OK: {changed}"); }
         catch { Tables = before; throw; }
     }
     Dictionary<string,Table> Snapshot() => Tables.ToDictionary(p => p.Key,p => p.Value.Clone(),StringComparer.OrdinalIgnoreCase);
@@ -43,7 +45,7 @@ public class Database : IDisposable
         {
             case CreateTable c:
                 if (c.Columns.Select(x=>x.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count()!=c.Columns.Count) throw new SqlException("Повтор имени столбца");
-                var fresh = new Table(c.Name,c.Columns); Validate(fresh); if (!Tables.TryAdd(c.Name,fresh)) throw new SqlException("Таблица уже существует"); return 0;
+                if(c.Columns.Count>256) throw new SqlException("Максимум 256 столбцов"); var fresh = new Table(c.Name,c.Columns); Validate(fresh); if (!Tables.TryAdd(c.Name,fresh)) throw new SqlException("Таблица уже существует"); return 0;
             case Insert ins:
                 var t = Get(ins.Table); var positions = ins.Columns?.Select(t.ColumnIndex).ToArray() ?? Enumerable.Range(0,t.Columns.Count).ToArray();
                 if (positions.Distinct().Count()!=positions.Length || positions.Length!=t.Columns.Count) throw new SqlException("Нужно указать все столбцы ровно один раз");
