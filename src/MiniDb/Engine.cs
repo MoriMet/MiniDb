@@ -14,9 +14,10 @@ public class Database : IDisposable
 {
     internal Dictionary<string,Table> Tables = new(StringComparer.OrdinalIgnoreCase);
     Dictionary<string,Table>? backup;
-    readonly string? path;
-    public Database(string? path = null) { this.path=path; if(path!=null && File.Exists(path)) Tables=DatabaseImage.Load(File.ReadAllBytes(path)); }
-    void Persist() { if(path==null) return; var image=DatabaseImage.Save(Tables); File.WriteAllBytes(path+".tmp",image); File.Move(path+".tmp",path,true); }
+    readonly WalStore? store;
+    public bool Recovered => store?.Recovered ?? false;
+    public Database(string? path = null) { if(path!=null) { store=new(path); try { var bytes=store.Read(); if(bytes!=null) Tables=DatabaseImage.Load(bytes); } catch { store.Dispose(); throw; } } }
+    void Persist() { store?.Commit(DatabaseImage.Save(Tables)); }
     public QueryResult Execute(string sql) => Execute(new Parser(sql).Parse());
     public QueryResult Execute(Statement statement)
     {
@@ -117,7 +118,7 @@ public class Database : IDisposable
         }
         if(q.Limit!=null) result=result.Take(q.Limit.Value).ToList(); return new(output,result,$"Строк: {result.Count}");
     }
-    public void Dispose() { }
+    public void Dispose() { if(backup!=null) { Tables=backup; backup=null; } store?.Dispose(); }
 }
 public class ValueComparer : IComparer<object>
 {
