@@ -4,9 +4,10 @@ public class Table(string name, List<ColumnDefinition> columns)
     public string Name { get; } = name;
     public List<ColumnDefinition> Columns { get; } = columns;
     public Dictionary<long, object[]> Rows { get; } = new();
+    public Dictionary<string,DbIndex> Indexes { get; } = new(StringComparer.OrdinalIgnoreCase);
     public long NextId { get; set; } = 1;
     public int ColumnIndex(string name) { int i = Columns.FindIndex(c => c.Name.Equals(name,StringComparison.OrdinalIgnoreCase)); if (i < 0) throw new SqlException($"Неизвестный столбец {name}"); return i; }
-    public Table Clone() { var t = new Table(Name,Columns.ToList()) { NextId = NextId }; foreach (var r in Rows) t.Rows.Add(r.Key,r.Value.ToArray()); return t; }
+    public Table Clone() { var t = new Table(Name,Columns.ToList()) { NextId = NextId }; foreach (var r in Rows) t.Rows.Add(r.Key,r.Value.ToArray()); foreach(var idx in Indexes.Values) t.Indexes.Add(idx.Name,new(idx.Name,idx.Column){Tree=idx.Tree}); return t; }
 }
 public record QueryResult(string[] Columns, List<object[]> Rows, string Message = "");
 public class Database : IDisposable
@@ -27,7 +28,7 @@ public class Database : IDisposable
         }
         if (statement is Select select) return SelectRows(select);
         var before = Snapshot();
-        try { int changed = Mutate(statement); _ = DatabaseImage.Save(Tables); if(backup==null) Persist(); return new([],[],$"OK: {changed}"); }
+        try { int changed = Mutate(statement); foreach(var table in Tables.Values) foreach(var idx in table.Indexes.Values) idx.Rebuild(table); _ = DatabaseImage.Save(Tables); if(backup==null) Persist(); return new([],[],$"OK: {changed}"); }
         catch { Tables = before; throw; }
     }
     Dictionary<string,Table> Snapshot() => Tables.ToDictionary(p => p.Key,p => p.Value.Clone(),StringComparer.OrdinalIgnoreCase);
@@ -43,6 +44,8 @@ public class Database : IDisposable
     {
         switch(s)
         {
+            case CreateIndex ci:
+                var it=Get(ci.Table); if(Tables.Values.Any(t=>t.Indexes.ContainsKey(ci.Name))) throw new SqlException("Индекс уже существует"); it.Indexes.Add(ci.Name,new(ci.Name,it.ColumnIndex(ci.Column))); return 0;
             case CreateTable c:
                 if (c.Columns.Select(x=>x.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count()!=c.Columns.Count) throw new SqlException("Повтор имени столбца");
                 if(c.Columns.Count>256) throw new SqlException("Максимум 256 столбцов"); var fresh = new Table(c.Name,c.Columns); Validate(fresh); if (!Tables.TryAdd(c.Name,fresh)) throw new SqlException("Таблица уже существует"); return 0;
@@ -68,6 +71,19 @@ public class Database : IDisposable
     static object Eval(Expression e,string[] h,object[] r) => e switch { Literal l=>l.Value, Column c=>r[Resolve(c.Name,h)], Binary b when b.Operator=="AND" => (bool)Eval(b.Left,h,r)&&(bool)Eval(b.Right,h,r), Binary b when b.Operator=="OR" => (bool)Eval(b.Left,h,r)||(bool)Eval(b.Right,h,r), Binary b=>Compare(Eval(b.Left,h,r),b.Operator,Eval(b.Right,h,r)), _=>throw new SqlException("Выражение не поддерживается") };
     static bool Compare(object a,string op,object b) { if(a.GetType()!=b.GetType()) throw new SqlException("Нельзя сравнивать INT и TEXT"); int c=ValueComparer.Instance.Compare(a,b); return op switch { "="=>c==0,"!=" or "<>"=>c!=0,">"=>c>0,"<"=>c<0,">="=>c>=0,"<="=>c<=0,_=>false }; }
     static bool Matches(Expression? e,string[] h,object[] r)=>e==null || (bool)Eval(e,h,r);
+    public long LastRowsExamined { get; private set; }
+    public bool ForceFullScan { get; set; }
+    (DbIndex Index,object Value)? ChooseIndex(Table t,Expression? e)
+    {
+        if(ForceFullScan) return null;
+        if(e is Binary {Operator:"AND"} and) return ChooseIndex(t,and.Left) ?? ChooseIndex(t,and.Right);
+        if(e is Binary {Operator:"="} b)
+        {
+            Column? c=b.Left as Column ?? b.Right as Column; Literal? l=b.Left as Literal ?? b.Right as Literal;
+            if(c!=null && l!=null) { int pos=Resolve(c.Name,Headers(t)); CheckType(t.Columns[pos],l.Value); var idx=t.Indexes.Values.FirstOrDefault(i=>i.Column==pos); if(idx!=null) return (idx,l.Value); }
+        }
+        return null;
+    }
     QueryResult SelectRows(Select q)
     {
         var t=Get(q.Table); string[] h=Headers(t); IEnumerable<object[]> rows=t.Rows.Values;
@@ -76,7 +92,11 @@ public class Database : IDisposable
         var groupPositions=q.Group.Select(n=>Resolve(n,h)).ToArray();
         bool aggregated=q.Fields.Any(f=>f.Aggregate!=null) || q.Group.Count>0;
         if(aggregated && q.Fields.Any(f=>f.Aggregate==null && !q.Group.Contains(f.Name,StringComparer.OrdinalIgnoreCase))) throw new SqlException("Столбец должен входить в GROUP BY");
-        if(q.Explain) return new(["Plan"],[new object[]{"Full scan"}]);
+        var candidate=ChooseIndex(t,q.Where);
+        if(q.Explain) return new(["Plan"],[new object[]{candidate==null ? "Full scan" : $"Index seek {candidate.Value.Index.Name} (B-tree equality)"}]);
+        LastRowsExamined=0;
+        if(candidate!=null) rows=candidate.Value.Index.Tree.Find(candidate.Value.Value).Select(id=>t.Rows[id]);
+        rows=rows.Select(r=>{ LastRowsExamined++; return r; });
         rows=rows.Where(r=>Matches(q.Where,h,r));
         var fields=q.Fields.Count==1 && q.Fields[0]==new Field("*") ? t.Columns.Select(c=>new Field(c.Name)).ToList() : q.Fields;
         if(fields.Any(f=>f.Name=="*"&&f.Aggregate==null)) throw new SqlException("* должен быть единственным полем");

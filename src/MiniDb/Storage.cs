@@ -32,6 +32,7 @@ public class RecordWriter
     public void Int(long n) { Span<byte> b=stackalloc byte[8]; BinaryPrimitives.WriteInt64LittleEndian(b,n); stream.Write(b); }
     public void Text(string s) { var b=Encoding.UTF8.GetBytes(s); Int(b.Length); stream.Write(b); }
     public void Value(object v) { Int(v is long?0:1); if(v is long n) Int(n); else Text((string)v); }
+    public void Raw(byte[] bytes) => stream.Write(bytes);
     public byte[] Bytes()=>stream.ToArray();
 }
 public class RecordReader(byte[] bytes)
@@ -39,6 +40,7 @@ public class RecordReader(byte[] bytes)
     int position;
     public long Int() { if(position+8>bytes.Length) throw new SqlException("Оборванная запись"); long n=BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(position)); position+=8; return n; }
     public string Text() { long length=Int(); if(length<0 || length>bytes.Length-position) throw new SqlException("Повреждена строка"); string s=Encoding.UTF8.GetString(bytes,position,(int)length); position+=(int)length; return s; }
+    public byte[] Remaining()=>bytes.AsSpan(position).ToArray();
     public object Value() { long tag=Int(); return tag switch { 0=>Int(),1=>Text(),_=>throw new SqlException("Неизвестный тип") }; }
 }
 public static class DatabaseImage
@@ -49,19 +51,28 @@ public static class DatabaseImage
         foreach(var t in tables.Values)
         {
             var w=new RecordWriter(); w.Int(1); w.Text(t.Name); w.Int(t.NextId); w.Int(t.Columns.Count); foreach(var c in t.Columns) { w.Text(c.Name); w.Text(c.Type); w.Int(c.PrimaryKey?1:0); } yield return w.Bytes();
+            foreach(var idx in t.Indexes.Values)
+            {
+                w=new(); w.Int(3); w.Text(t.Name); w.Text(idx.Name); w.Int(idx.Column); yield return w.Bytes();
+                byte[] tree=idx.Tree.Serialize(); for(int offset=0;offset<tree.Length;offset+=3000) { w=new(); w.Int(4); w.Text(t.Name); w.Text(idx.Name); w.Raw(tree.AsSpan(offset,Math.Min(3000,tree.Length-offset)).ToArray()); yield return w.Bytes(); }
+            }
             foreach(var row in t.Rows) { w=new(); w.Int(2); w.Text(t.Name); w.Int(row.Key); foreach(var value in row.Value) w.Value(value); yield return w.Bytes(); }
         }
     }
     public static Dictionary<string,Table> Load(byte[] bytes)
     {
         var tables=new Dictionary<string,Table>(StringComparer.OrdinalIgnoreCase);
+        var indexBytes=new Dictionary<(string Table,string Index),MemoryStream>();
         foreach(var record in PageFormat.Decode(bytes))
         {
             var r=new RecordReader(record); long kind=r.Int(); string name=r.Text();
             if(kind==1) { long next=r.Int(), count=r.Int(); if(count<1 || count>256) throw new SqlException("Некорректная схема"); var columns=new List<ColumnDefinition>(); for(int i=0;i<count;i++) columns.Add(new(r.Text(),r.Text(),r.Int()!=0)); tables.Add(name,new(name,columns){NextId=next}); }
             else if(kind==2) { var t=tables[name]; long id=r.Int(); var row=new object[t.Columns.Count]; for(int i=0;i<row.Length;i++) row[i]=r.Value(); t.Rows.Add(id,row); }
+            else if(kind==3) { string index=r.Text(); int col=checked((int)r.Int()); tables[name].Indexes.Add(index,new(index,col)); indexBytes.Add((name,index),new()); }
+            else if(kind==4) { string index=r.Text(); indexBytes[(name,index)].Write(r.Remaining()); }
             else throw new SqlException("Неизвестный вид записи");
         }
+        foreach(var p in indexBytes) { tables[p.Key.Table].Indexes[p.Key.Index].Tree=BTree.Deserialize(p.Value.ToArray()); p.Value.Dispose(); }
         return tables;
     }
 }
